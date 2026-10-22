@@ -3,6 +3,7 @@
 
 import os
 import re
+import html
 import json
 import argparse
 import datetime as dt
@@ -79,6 +80,20 @@ def ics_unescape(s: str) -> str:
             .replace(r"\,", ",")
             .replace(r"\;", ";")
             .replace(r"\\", "\\"))
+
+
+
+def html_to_text(s: str) -> str:
+    """Google Calendar зберігає опис, набраний у своєму редакторі, як HTML
+    (<br>, <a href>, <b> ...). Повертаємо звичайні рядки, щоб «Код:» і «Викл.:»
+    знаходились на початку рядка, а посилання бралось зі справжнього href."""
+    if not s or "<" not in s:
+        return s
+    s = re.sub(r'<a\s[^>]*href="([^"]+)"[^>]*>.*?</a>', r' \1 ', s, flags=re.I | re.S)
+    s = re.sub(r'<br\s*/?>|</p>|</div>|</li>', '\n', s, flags=re.I)
+    s = re.sub(r'<[^>]+>', '', s)
+    s = html.unescape(s).replace('\u00a0', ' ')
+    return "\n".join(line.strip() for line in s.splitlines())
 
 
 @dataclass
@@ -207,8 +222,8 @@ def parse_ics_events(ics_text: str) -> List[Event]:
         start = _parse_dt(dtstart_val, dtstart_tz)
         end = _parse_dt(dtend_val, dtend_tz)
         summary = ics_unescape(summary_raw).strip()
-        description = ics_unescape(description_raw).strip()
-        location = ics_unescape(location_raw).strip()
+        description = html_to_text(ics_unescape(description_raw)).strip()
+        location = html_to_text(ics_unescape(location_raw)).strip()
         events.append(Event(start=start, end=end, summary=summary,
                             description=description, location=location))
         cur = {}
