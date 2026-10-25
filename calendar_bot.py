@@ -9,6 +9,7 @@ import argparse
 import datetime as dt
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict
+from urllib.parse import urlparse, parse_qs
 from zoneinfo import ZoneInfo
 
 import requests
@@ -57,6 +58,7 @@ def pair_no(t: dt.datetime) -> Optional[int]:
 MOODLE_LINKS = {
     # Наповнити після отримання PDF розкладу ГРС-16Дмб —
     # формат: "Точна назва дисципліни": "https://distance.kuk.edu.ua/..."
+    # Посилання на Moodle з опису події має пріоритет над цим словником.
 }
 
 
@@ -80,7 +82,6 @@ def ics_unescape(s: str) -> str:
             .replace(r"\,", ",")
             .replace(r"\;", ";")
             .replace(r"\\", "\\"))
-
 
 
 def html_to_text(s: str) -> str:
@@ -273,9 +274,14 @@ UA_DOW = {
     3: "Четвер", 4: "Пʼятниця", 5: "Субота", 6: "Неділя",
 }
 
+RKR_TYPE = "Ректорська контрольна робота"
+
 
 def detect_type(tail: str) -> Optional[str]:
     t = tail.strip().lower()
+    # РКР перевіряємо першою — «контрольна» не повинна потрапити в інші типи
+    if "ректор" in t or re.search(r"\bркр\b", t):
+        return RKR_TYPE
     if "лекц" in t:
         return "Лекція"
     if "практ" in t or t == "пр." or t == "пр":
@@ -295,8 +301,10 @@ def detect_type(tail: str) -> Optional[str]:
     return None
 
 
-# Типи що відображаються як виділений блок з рамкою
+# Заліки/іспити — виділений блок, лише аудиторія (без Zoom)
 EXAM_TYPES = {"Залік", "Іспит", "Екзамен"}
+# Усі типи, що показуються виділеним блоком з рамкою і йдуть першими
+HIGHLIGHT_TYPES = EXAM_TYPES | {RKR_TYPE}
 
 
 def split_summary(summary: str) -> Tuple[str, Optional[str]]:
@@ -321,40 +329,108 @@ def split_summary(summary: str) -> Tuple[str, Optional[str]]:
     return s, None
 
 
-def _normalize_for_links(text: str) -> str:
+# ───────────────────────── Посилання ─────────────────────────
+
+MEETING_KINDS = ("zoom", "meet", "teams")
+MEETING_NAMES = {"zoom": "Zoom", "meet": "Google Meet", "teams": "Teams"}
+LINK_LABELS = {
+    "zoom": "🔗 <a href=\"{u}\">Відкрити Zoom</a>",
+    "meet": "🔗 <a href=\"{u}\">Відкрити Google Meet</a>",
+    "teams": "🔗 <a href=\"{u}\">Відкрити Teams</a>",
+    "moodle": "📘 <a href=\"{u}\">Відкрити Moodle</a>",
+    "other": "🔗 <a href=\"{u}\">Посилання</a>",
+}
+
+
+def _unwrap_google_redirect(url: str) -> str:
+    """Google Calendar іноді обгортає посилання в google.com/url?q=..."""
+    try:
+        p = urlparse(url)
+        if p.netloc.endswith("google.com") and p.path == "/url":
+            qs = parse_qs(p.query)
+            target = (qs.get("q") or qs.get("url") or [None])[0]
+            if target and target.startswith("http"):
+                return target
+    except Exception:
+        pass
+    return url
+
+
+def _clean_url(url: str) -> str:
+    url = url.rstrip(".,;:!?)]}»\"'")
+    return _unwrap_google_redirect(url)
+
+
+def classify_link(url: str) -> str:
+    u = url.lower()
+    if "zoom.us" in u:
+        return "zoom"
+    if "meet.google.com" in u:
+        return "meet"
+    if "teams.microsoft" in u or "teams.live" in u:
+        return "teams"
+    if "moodle" in u or "distance.kuk.edu.ua" in u:
+        return "moodle"
+    return "other"
+
+
+def extract_links(text: str) -> List[Tuple[str, str]]:
+    """Усі посилання з тексту як [(тип, url)], без дублів, у порядку появи."""
     if not text:
-        return ""
-    t = text.replace("\\n", "\n")
-    t = t.replace("\u200b", "")
-    return t
+        return []
+    t = text.replace("\\n", "\n").replace("\u200b", "")
+    out: List[Tuple[str, str]] = []
+    seen = set()
+    for raw in URL_RE.findall(t):
+        u = _clean_url(raw)
+        if u in seen:
+            continue
+        seen.add(u)
+        out.append((classify_link(u), u))
+    return out
 
 
-def extract_zoom_links(text: str) -> List[str]:
-    t = _normalize_for_links(text)
-    links = URL_RE.findall(t)
-    zoom = [l for l in links if "zoom.us" in l.lower()]
-    rest = [l for l in links if l not in zoom]
-    return zoom + rest
+# ───────────────────────── Викладач ─────────────────────────
+
+# Префікси: довші форми стоять першими, а lookahead не дає «викл»
+# зачепити початок слова «викладач».
+TEACHER_PREFIX_RE = re.compile(
+    r"^(?:ст\.?\s*викл\.?|старший\s+викладач|викладач|викл\.?|доцент|доц\.?|"
+    r"професор|проф\.?|асистент|асист\.?|лектор|піб)"
+    r"(?![а-яіїєґʼ'’])\s*[:\-–—]?\s*(.+)$",
+    re.IGNORECASE,
+)
+
+_NAME_WORD = r"[А-ЯІЇЄҐ][а-яіїєґʼ'’\-]+"
+_INITIALS = r"[А-ЯІЇЄҐ]\.\s?[А-ЯІЇЄҐ]\.?"
+# Рядок, що складається лише з ПІБ:
+#   «Іваненко І.П.», «І.П. Іваненко», «Іваненко Ірина Петрівна»
+PIB_RE = re.compile(
+    rf"^(?:{_NAME_WORD}\s+{_INITIALS}|{_INITIALS}\s+{_NAME_WORD}|"
+    rf"{_NAME_WORD}(?:\s+{_NAME_WORD}){{2}})$"
+)
 
 
 def extract_teacher(description: str) -> Optional[str]:
     if not description:
         return None
     lines = [l.strip() for l in description.splitlines() if l.strip()]
-    patterns = [
-        r"^(?:доц\.?|доцент)\s*[:\-]?\s*(.+)$",
-        r"^(?:викл\.?|викладач)\s*[:\-]?\s*(.+)$",
-        r"^(?:проф\.?|професор)\s*[:\-]?\s*(.+)$",
-        r"^(?:асист\.?|асистент)\s*[:\-]?\s*(.+)$",
-        r"^(?:Доц\.?|Доцент)\s*[:\-]?\s*(.+)$",
-        r"^(?:Викл\.?|Викладач)\s*[:\-]?\s*(.+)$",
-        r"^(?:Проф\.?|Професор)\s*[:\-]?\s*(.+)$",
-    ]
+
+    # 1) Явний префікс: «Викладач: ...», «доц. ...», «ПІБ: ...»
     for line in lines:
-        for pat in patterns:
-            m = re.match(pat, line, flags=re.IGNORECASE)
-            if m:
-                return m.group(1).strip()
+        m = TEACHER_PREFIX_RE.match(line)
+        if m:
+            val = URL_RE.sub("", m.group(1)).strip(" ,;:-–—")
+            if val:
+                return val
+
+    # 2) Рядок, який сам по собі є ПІБ (без префікса)
+    for line in lines:
+        if URL_RE.search(line) or re.search(r"\d", line):
+            continue
+        cand = line.strip(" ,;")
+        if PIB_RE.match(cand):
+            return cand
     return None
 
 
@@ -373,18 +449,25 @@ def extract_passcode(text: str) -> Optional[str]:
     return None
 
 
-def classify_place(location: str, description: str) -> str:
+AUD_RE = re.compile(r"(ауд\.?\s*\d+)", re.IGNORECASE)
+
+
+def classify_place(location: str, description: str,
+                   meeting_kind: Optional[str] = None) -> str:
     blob = f"{location}\n{description}".lower()
-    if "online" in blob or "zoom" in blob:
-        m = re.search(r"(ауд\.?\s*\d+)", blob, flags=re.IGNORECASE)
-        if m:
-            return f"🌐 Online (Zoom) • 🏫 {m.group(1).strip()}"
-        return "🌐 Online (Zoom)"
-    m2 = re.search(r"(ауд\.?\s*\d+)", blob, flags=re.IGNORECASE)
-    if m2:
-        return f"🏫 {m2.group(1).strip()}"
-    if location.strip():
-        return f"📍 {location.strip()}"
+    aud = AUD_RE.search(blob)
+    online = bool(meeting_kind) or "online" in blob or "онлайн" in blob or "zoom" in blob
+    if online:
+        name = MEETING_NAMES.get(meeting_kind) or ("Zoom" if "zoom" in blob else None)
+        label = f"🌐 Online ({name})" if name else "🌐 Online"
+        if aud:
+            return f"{label} • 🏫 {aud.group(1).strip()}"
+        return label
+    if aud:
+        return f"🏫 {aud.group(1).strip()}"
+    loc = URL_RE.sub("", location).strip(" ,;\n")
+    if loc:
+        return f"📍 {loc}"
     return "📍 (місце не вказано)"
 
 
@@ -474,6 +557,10 @@ def escape_html_attr(s: str) -> str:
     return escape_html(s).replace('"', "&quot;")
 
 
+def link_line(kind: str, url: str) -> str:
+    return LINK_LABELS[kind].format(u=escape_html_attr(url))
+
+
 def format_day(events: List[Event], day: dt.date) -> str:
     lines = []
     lines.append(day_header(day))
@@ -483,26 +570,37 @@ def format_day(events: List[Event], day: dt.date) -> str:
         lines.append("— (пар немає)")
         return "\n".join(lines)
 
-    # Заліки/іспити завжди першими, потім решта пар за часом
-    exams = [ev for ev in events if split_summary(ev.summary)[1] in EXAM_TYPES]
-    pairs = [ev for ev in events if split_summary(ev.summary)[1] not in EXAM_TYPES]
-    sorted_events = exams + pairs
+    # Заліки/іспити/РКР завжди першими, потім решта пар за часом
+    top = [ev for ev in events if split_summary(ev.summary)[1] in HIGHLIGHT_TYPES]
+    rest = [ev for ev in events if split_summary(ev.summary)[1] not in HIGHLIGHT_TYPES]
+    sorted_events = top + rest
 
     for ev in sorted_events:
         discipline, etype = split_summary(ev.summary)
+        text_blob = ev.description + "\n" + ev.location
         teacher = extract_teacher(ev.description)
-        passcode = extract_passcode(ev.description + "\n" + ev.location + "\n" + ev.summary)
-        place = classify_place(ev.location, ev.description)
-        links = extract_zoom_links(ev.description + "\n" + ev.location)
-        link = links[0] if links else None
-        moodle_url = MOODLE_LINKS_NORM.get(normalize_discipline(discipline))
-        is_exam = etype in EXAM_TYPES
+        passcode = extract_passcode(text_blob + "\n" + ev.summary)
+        links = extract_links(text_blob)
 
-        if is_exam:
-            # Залік/Іспит — виділений блок з рамкою, без номера пари
+        meeting = next(((k, u) for k, u in links if k in MEETING_KINDS), None)
+        moodle_url = (next((u for k, u in links if k == "moodle"), None)
+                      or MOODLE_LINKS_NORM.get(normalize_discipline(discipline)))
+        other_links = [u for k, u in links if k == "other"][:2]
+
+        is_exam = etype in EXAM_TYPES
+        is_rkr = etype == RKR_TYPE
+        highlighted = is_exam or is_rkr
+
+        if highlighted:
             lines.append(separator())
-            lines.append(f"📝 <b>{etype.upper()}!</b>")
-            lines.append(f"🕒 <b>{hhmm(ev.start)}–{hhmm(ev.end)}</b>")
+            icon = "🛑" if is_rkr else "📝"
+            lines.append(f"{icon} <b>{etype.upper()}!</b>")
+            if is_rkr:
+                pno = pair_no(ev.start)
+                pfx = f"{pno} пара " if pno else ""
+                lines.append(f"🕒 <b>{pfx}{hhmm(ev.start)}–{hhmm(ev.end)}</b>")
+            else:
+                lines.append(f"🕒 <b>{hhmm(ev.start)}–{hhmm(ev.end)}</b>")
         else:
             pno = pair_no(ev.start)
             pfx = f"{pno} пара " if pno else ""
@@ -511,32 +609,34 @@ def format_day(events: List[Event], day: dt.date) -> str:
         lines.append(f"📚 <b>{escape_html(discipline)}</b>")
 
         if moodle_url:
-            href_m = escape_html_attr(moodle_url)
-            lines.append(f'📘 <a href="{href_m}">Відкрити Moodle</a>')
+            lines.append(link_line("moodle", moodle_url))
 
-        if etype and not is_exam:
+        if etype and not highlighted:
             lines.append(f"🎓 {etype}")
 
         if teacher:
             lines.append(f"👩\u200d🏫 {escape_html(teacher)}")
 
-        # Для заліків — тільки аудиторія, без Zoom
         if is_exam:
-            aud = re.search(r"(ауд\.?\s*\d+)",
-                            f"{ev.location}\n{ev.description}".lower(),
-                            re.IGNORECASE)
+            # Для заліків/іспитів — тільки аудиторія, без Zoom
+            aud = AUD_RE.search(f"{ev.location}\n{ev.description}".lower())
             if aud:
                 lines.append(f"🏫 {aud.group(1).strip()}")
         else:
-            lines.append(escape_html(place))
-            if link:
-                href = escape_html_attr(link)
-                lines.append(f'🔗 <a href="{href}">Відкрити Zoom</a>')
+            place = classify_place(ev.location, ev.description,
+                                   meeting[0] if meeting else None)
+            # Якщо є лише Moodle і більше нічого — «місце не вказано» не пишемо
+            if not (moodle_url and place == "📍 (місце не вказано)"):
+                lines.append(escape_html(place))
+            if meeting:
+                lines.append(link_line(meeting[0], meeting[1]))
+            for u in other_links:
+                lines.append(link_line("other", u))
             if passcode:
                 lines.append("🔑 Код доступу:")
                 lines.append(f"📎 <code>{escape_html(passcode)}</code>")
 
-        if is_exam:
+        if highlighted:
             lines.append(separator())
 
         lines.append("")
