@@ -63,7 +63,7 @@ MOODLE_LINKS = {
 
 
 def normalize_discipline(name: str) -> str:
-    return " ".join((name or "").replace("'", "'").split()).casefold()
+    return " ".join((name or "").replace("\u2019", "'").replace("\u02bc", "'").split()).casefold()
 
 
 MOODLE_LINKS_NORM = {
@@ -282,6 +282,8 @@ def detect_type(tail: str) -> Optional[str]:
     # РКР перевіряємо першою — «контрольна» не повинна потрапити в інші типи
     if "ректор" in t or re.search(r"\bркр\b", t):
         return RKR_TYPE
+    if "гостьова" in t:
+        return "Гостьова Лекція"
     if "лекц" in t:
         return "Лекція"
     if "практ" in t or t == "пр." or t == "пр":
@@ -316,6 +318,12 @@ def split_summary(summary: str) -> Tuple[str, Optional[str]]:
             return left.strip(), etype
     if " - " in s:
         left, right = s.rsplit(" - ", 1)
+        etype = detect_type(right)
+        if etype:
+            return left.strip(), etype
+    # «Маркетинг-Лекція» без пробілів
+    if "-" in s:
+        left, right = s.rsplit("-", 1)
         etype = detect_type(right)
         if etype:
             return left.strip(), etype
@@ -449,7 +457,11 @@ def extract_passcode(text: str) -> Optional[str]:
     return None
 
 
-AUD_RE = re.compile(r"(ауд\.?\s*\d+)", re.IGNORECASE)
+AUD_RE = re.compile(r"ауд\.?\s*(\d+)", re.IGNORECASE)
+
+
+def fmt_aud(m: "re.Match") -> str:
+    return f"ауд. {m.group(1)}"
 
 
 def classify_place(location: str, description: str,
@@ -461,10 +473,10 @@ def classify_place(location: str, description: str,
         name = MEETING_NAMES.get(meeting_kind) or ("Zoom" if "zoom" in blob else None)
         label = f"🌐 Online ({name})" if name else "🌐 Online"
         if aud:
-            return f"{label} • 🏫 {aud.group(1).strip()}"
+            return f"{label} • 🏫 {fmt_aud(aud)}"
         return label
     if aud:
-        return f"🏫 {aud.group(1).strip()}"
+        return f"🏫 {fmt_aud(aud)}"
     loc = URL_RE.sub("", location).strip(" ,;\n")
     if loc:
         return f"📍 {loc}"
@@ -621,7 +633,7 @@ def format_day(events: List[Event], day: dt.date) -> str:
             # Для заліків/іспитів — тільки аудиторія, без Zoom
             aud = AUD_RE.search(f"{ev.location}\n{ev.description}".lower())
             if aud:
-                lines.append(f"🏫 {aud.group(1).strip()}")
+                lines.append(f"🏫 {fmt_aud(aud)}")
         else:
             place = classify_place(ev.location, ev.description,
                                    meeting[0] if meeting else None)
