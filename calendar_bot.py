@@ -305,7 +305,7 @@ def detect_type(tail: str) -> Optional[str]:
 
 # Заліки/іспити — виділений блок, лише аудиторія (без Zoom)
 EXAM_TYPES = {"Залік", "Іспит", "Екзамен"}
-# Усі типи, що показуються виділеним блоком з рамкою і йдуть першими
+# Усі типи, що показуються виділеним блоком з рамкою
 HIGHLIGHT_TYPES = EXAM_TYPES | {RKR_TYPE}
 
 
@@ -582,9 +582,9 @@ def format_day(events: List[Event], day: dt.date) -> str:
         lines.append("— (пар немає)")
         return "\n".join(lines)
 
-    # Заліки/іспити/РКР завжди першими, потім решта пар за часом
-    top = [ev for ev in events if split_summary(ev.summary)[1] in HIGHLIGHT_TYPES]
-    rest = [ev for ev in events if split_summary(ev.summary)[1] not in HIGHLIGHT_TYPES]
+    # Заліки/іспити — першими; РКР лишається на своєму місці за часом (у рамці)
+    top = [ev for ev in events if split_summary(ev.summary)[1] in EXAM_TYPES]
+    rest = [ev for ev in events if split_summary(ev.summary)[1] not in EXAM_TYPES]
     sorted_events = top + rest
 
     for ev in sorted_events:
