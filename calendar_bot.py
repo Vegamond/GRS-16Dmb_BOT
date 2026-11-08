@@ -894,7 +894,10 @@ def tg_send_message(
         "parse_mode": "HTML",
     }
     if preview_url:
-        # Велика картинка НАД текстом — у тому ж повідомленні
+        # Велика картинка НАД текстом — у тому ж повідомленні.
+        # Невидиме посилання на картинку на самому початку тексту: без нього
+        # Telegram іноді взагалі не будує прев'ю з link_preview_options.url.
+        payload["text"] = f'<a href="{escape_html_attr(preview_url)}">\u2060</a>' + text
         payload["link_preview_options"] = {
             "url": preview_url,
             "prefer_large_media": True,
@@ -1070,6 +1073,7 @@ def publish_card(path: str, today: dt.date) -> Optional[str]:
         for _ in range(5):
             try:
                 if requests.head(url, timeout=10).status_code == 200:
+                    time.sleep(3)
                     return url
             except requests.RequestException:
                 pass
