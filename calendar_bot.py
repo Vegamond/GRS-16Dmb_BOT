@@ -886,6 +886,7 @@ def tg_send_message(
     message_thread_id: Optional[int] = None,
     reply_markup: Optional[Dict] = None,
     preview_url: Optional[str] = None,
+    silent: bool = False,
 ) -> None:
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
@@ -907,6 +908,8 @@ def tg_send_message(
         payload["link_preview_options"] = {"is_disabled": True}
     if message_thread_id is not None:
         payload["message_thread_id"] = message_thread_id
+    if silent:
+        payload["disable_notification"] = True
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
     r = requests.post(url, json=payload, timeout=30)
@@ -917,8 +920,10 @@ def tg_send_message(
 
 
 def tg_send_photo(token: str, chat_id: str, path: str,
-                  message_thread_id: Optional[int] = None) -> None:
+                  message_thread_id: Optional[int] = None, silent: bool = False) -> None:
     data = {"chat_id": chat_id}
+    if silent:
+        data["disable_notification"] = "true"
     if message_thread_id is not None:
         data["message_thread_id"] = message_thread_id
     with open(path, "rb") as f:
@@ -1085,6 +1090,10 @@ def publish_card(path: str, today: dt.date) -> Optional[str]:
         return None
 
 
+QUIET_UNTIL = 7   # до цієї години пости йдуть без звуку
+QUIET_FROM = 22   # і з цієї години — теж
+
+
 TEST_BANNER = "🧪 <b>ТЕСТ</b> — це бачиш тільки ти, у групу не пішло\n\n"
 
 
@@ -1116,13 +1125,18 @@ def main():
         chat_id = env_required("TG_CHAT_ID")
         schedule_thread_id = env_optional_int("TG_SCHEDULE_THREAD_ID")
 
+    # Рано-вранці (до 07:00) і пізно ввечері (з 22:00) — без звуку, щоб нікого не будити
+    hour = now_kyiv().hour
+    silent = hour < QUIET_UNTIL or hour >= QUIET_FROM
+
     def send(text: str, thread: Optional[int] = None,
              reply_markup: Optional[Dict] = None, banner: bool = True,
              preview_url: Optional[str] = None) -> None:
         if test and banner:
             text = TEST_BANNER + text
         tg_send_message(token, chat_id, text, message_thread_id=thread,
-                        reply_markup=reply_markup, preview_url=preview_url)
+                        reply_markup=reply_markup, preview_url=preview_url,
+                        silent=silent)
 
     def send_with_card(text: str, card: Optional[str], thread: Optional[int] = None,
                        banner: bool = True) -> None:
@@ -1134,7 +1148,7 @@ def main():
             return
         if card:
             try:
-                tg_send_photo(token, chat_id, card, message_thread_id=thread)
+                tg_send_photo(token, chat_id, card, message_thread_id=thread, silent=silent)
             except Exception as e:
                 print(f"WARNING: photo failed: {e}")
         send(text, thread, banner=banner)
