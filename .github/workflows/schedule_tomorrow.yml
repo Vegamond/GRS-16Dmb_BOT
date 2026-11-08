@@ -1,7 +1,7 @@
 name: Schedule - Tomorrow
 
 on:
-  # Щодня ~18:17 за Києвом. Хвилина :17, а не :00 — менше черга в GitHub і менше запізнень.
+  # Щодня ~18:17 за Києвом (у неділю — ще й тижневий розклад). Хвилина :17, а не :00 — менше черга в GitHub і менше запізнень.
   # Час UTC: взимку Київ = UTC+2. Улітку (з останньої неділі березня) Київ = UTC+3 —
   # тоді годину в cron треба зменшити на 1.
   # Якщо налаштуєш точний запуск з cron-job.org (через workflow_dispatch), цей
@@ -42,13 +42,29 @@ jobs:
         run: |
           python calendar_bot.py tomorrow
 
+      # У неділю ввечері — ще й розклад на наступний тиждень (у гілку «Розклад»)
+      - name: Post schedule (week, on Sundays)
+        if: always()
+        env:
+          GCAL_ICS_URL: ${{ secrets.GCAL_ICS_URL }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          TG_SCHEDULE_THREAD_ID: ${{ secrets.TG_SCHEDULE_THREAD_ID }}
+        run: |
+          if [ "$(TZ=Europe/Kyiv date +%u)" = "7" ]; then
+            python calendar_bot.py week
+          else
+            echo "Not Sunday — no weekly post."
+          fi
+
       - name: Commit state
+        if: always()
         run: |
           if [[ -n "$(git status --porcelain -- state.json)" ]]; then
             git config user.name "github-actions"
             git config user.email "github-actions@github.com"
             git add state.json
-            git commit -m "Update state (tomorrow)"
+            git commit -m "Update state (evening)"
             git pull --rebase origin main
             git push
           else
