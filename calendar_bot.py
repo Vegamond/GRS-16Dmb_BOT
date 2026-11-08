@@ -98,6 +98,25 @@ def load_moodle_links() -> Dict[str, str]:
 
 MOODLE_LINKS = load_moodle_links()
 
+ZOOM_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zoom.json")
+
+
+def load_zoom_overrides() -> Dict[str, str]:
+    """Підміна посилання на пару, якщо в календарі воно неправильне.
+    zoom.json поруч з ботом: {"частина назви дисципліни": "https://...zoom.us/j/..."}.
+    Збіг — якщо назва дисципліни МІСТИТЬ ключ (без урахування регістру).
+    Ключі, що починаються з «_», ігноруються."""
+    try:
+        with open(ZOOM_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"WARNING: zoom.json is broken, overrides skipped: {e}")
+        return {}
+    return {normalize_discipline(k): v for k, v in data.items()
+            if isinstance(v, str) and v.startswith("http") and not k.startswith("_")}
+
 
 def normalize_discipline(name: str) -> str:
     return " ".join((name or "").replace("’", "'").replace("ʼ", "'").split()).casefold()
@@ -108,6 +127,7 @@ MOODLE_LINKS_NORM = {
     for k, v in MOODLE_LINKS.items()
     if v
 }
+ZOOM_OVERRIDES = load_zoom_overrides()
 
 
 def ics_unescape(s: str) -> str:
@@ -687,8 +707,14 @@ def event_links(ev: Event):
     discipline, _ = split_summary(ev.summary)
     links = extract_links(ev.description + "\n" + ev.location)
     meeting = next(((k, u) for k, u in links if k in MEETING_KINDS), None)
+    # Підміна з zoom.json має перевагу над посиланням з календаря
+    disc_norm = normalize_discipline(discipline)
+    for key, url in ZOOM_OVERRIDES.items():
+        if key and key in disc_norm:
+            meeting = (classify_link(url) if classify_link(url) in MEETING_KINDS else "zoom", url)
+            break
     moodle_url = (next((u for k, u in links if k == "moodle"), None)
-                  or MOODLE_LINKS_NORM.get(normalize_discipline(discipline)))
+                  or MOODLE_LINKS_NORM.get(disc_norm))
     other_links = [u for k, u in links if k == "other"][:2]
     return meeting, moodle_url, other_links
 
@@ -700,6 +726,9 @@ def format_event(ev: Event, with_links: bool = True) -> List[str]:
     teacher = extract_teacher(ev.description)
     passcode = extract_passcode(text_blob + "\n" + ev.summary)
     meeting, moodle_url, other_links = event_links(ev)
+    # Zoom підмінено з zoom.json — код з календаря належить старому посиланню
+    if meeting and meeting[1] in ZOOM_OVERRIDES.values():
+        passcode = None
 
     is_exam = etype in EXAM_TYPES
     is_rkr = etype == RKR_TYPE
