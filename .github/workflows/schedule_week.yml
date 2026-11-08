@@ -1,15 +1,27 @@
 name: Schedule - Week
 
 on:
+  # Неділя ~18:17 за Києвом. Хвилина :17, а не :00 — менше черга в GitHub і менше запізнень.
+  # Час UTC: взимку Київ = UTC+2. Улітку (з останньої неділі березня) Київ = UTC+3 —
+  # тоді годину в cron треба зменшити на 1.
+  # Якщо налаштуєш точний запуск з cron-job.org (через workflow_dispatch), цей
+  # розклад стане запасним: повторний запуск бот пропустить за state.json.
   schedule:
-    # Sunday 18:00 Kyiv = 15:00 UTC while summer time (EEST, UTC+3) is in effect.
-    # DST ends 2026-10-25 — after that, Kyiv is UTC+2 (EET), so switch this
-    # to "0 16 * * 0" (16:00 UTC = 18:00 Kyiv in winter).
-    - cron: "0 15 * * 0"
+    - cron: "17 16 * * 0"
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Опублікувати поточний тиждень зараз (не лише в неділю)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
+
+# Два запуски одного поста — лише по черзі (захист від дублів)
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
 
 jobs:
   run:
@@ -27,18 +39,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Post schedule (week) to Schedule thread
+      - name: Post schedule (week)
         env:
           GCAL_ICS_URL: ${{ secrets.GCAL_ICS_URL }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           TG_SCHEDULE_THREAD_ID: ${{ secrets.TG_SCHEDULE_THREAD_ID }}
         run: |
-          python calendar_bot.py week
+          python calendar_bot.py week ${{ inputs.force && '--force' || '' }}
 
       - name: Commit state
         run: |
-          if [[ -n "$(git status --porcelain)" ]]; then
+          if [[ -n "$(git status --porcelain -- state.json)" ]]; then
             git config user.name "github-actions"
             git config user.email "github-actions@github.com"
             git add state.json

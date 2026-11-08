@@ -1,15 +1,22 @@
 name: Schedule - Today
 
 on:
+  # Щодня ~06:17 за Києвом. Хвилина :17, а не :00 — менше черга в GitHub і менше запізнень.
+  # Час UTC: взимку Київ = UTC+2. Улітку (з останньої неділі березня) Київ = UTC+3 —
+  # тоді годину в cron треба зменшити на 1.
+  # Якщо налаштуєш точний запуск з cron-job.org (через workflow_dispatch), цей
+  # розклад стане запасним: повторний запуск бот пропустить за state.json.
   schedule:
-    # 06:00 Kyiv = 03:00 UTC while summer time (EEST, UTC+3) is in effect.
-    # DST ends 2026-10-25 — after that, Kyiv is UTC+2 (EET), so switch this
-    # to "0 4 * * *" (04:00 UTC = 06:00 Kyiv in winter).
-    - cron: "0 3 * * *"
+    - cron: "17 4 * * *"
   workflow_dispatch:
 
 permissions:
   contents: write
+
+# Два запуски одного поста — лише по черзі (захист від дублів)
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
 
 jobs:
   run:
@@ -37,7 +44,7 @@ jobs:
 
       - name: Commit state
         run: |
-          if [[ -n "$(git status --porcelain)" ]]; then
+          if [[ -n "$(git status --porcelain -- state.json)" ]]; then
             git config user.name "github-actions"
             git config user.email "github-actions@github.com"
             git add state.json

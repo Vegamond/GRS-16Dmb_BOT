@@ -3,6 +3,8 @@
 
 import os
 import re
+import time
+import subprocess
 import html
 import json
 import argparse
@@ -18,14 +20,33 @@ KYIV_TZ = ZoneInfo("Europe/Kyiv")
 STATE_FILE = "state.json"
 TG_MAX_LEN = 4096
 
-# Банка «На каву адміну ☕» — блок додається лише в недільний тижневий пост
+# Банка «На каву адміну ☕» — окреме повідомлення з кнопкою після тижневого посту
 DONATE_URL = "https://send.monobank.ua/jar/2rWrXwkk7H"
+# Номер картки банки (monobank → банка → «Поповнити з картки іншого банку»).
+# Порожній рядок — кнопка копіювання не показується.
+DONATE_CARD = "4874 1000 3360 9226"
 DONATE_LINE = (
-    "<blockquote>"
-    "☕ <b>Розклад тобі допомагає?</b>\n"
-    f'💛 <b><u><a href="{DONATE_URL}">ДОНАТ НА КАВУ АДМІНУ</a></u></b> 👈'
-    "</blockquote>"
+    "☕ <b>Розклад тобі допомагає?</b>\n\n"
+    "Бот працює щодня, а підтримує його адмін у вільний час.\n"
+    "Якщо розклад стає в пригоді — пригости адміна кавою 💛"
 )
+if DONATE_CARD:
+    DONATE_LINE += (
+        "\n\n💳 Немає монобанку? Скопіюй номер картки банки "
+        "і переказуй з будь-якого банку."
+    )
+
+
+def donate_button() -> Dict:
+    rows = [[{"text": "☕ Банка monobank", "url": DONATE_URL}]]
+    if DONATE_CARD:
+        # Кнопка копіює номер у буфер обміну одним дотиком
+        rows.append([{"text": "📋 Скопіювати номер картки",
+                      "copy_text": {"text": DONATE_CARD.replace(" ", "")}}])
+    return {"inline_keyboard": rows}
+
+
+DONATE_BUTTON = donate_button()
 
 
 def tg_visible_len(html_text: str) -> int:
@@ -55,15 +76,31 @@ def pair_no(t: dt.datetime) -> Optional[int]:
     return PAIR_BY_START.get(s)
 
 
-MOODLE_LINKS = {
-    # Наповнити після отримання PDF розкладу ГРС-16Дмб —
-    # формат: "Точна назва дисципліни": "https://distance.kuk.edu.ua/..."
-    # Посилання на Moodle з опису події має пріоритет над цим словником.
-}
+MOODLE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "moodle.json")
+
+
+def load_moodle_links() -> Dict[str, str]:
+    """Посилання на курси Moodle для цієї групи — у moodle.json поруч з ботом:
+    {"Назва дисципліни": "https://distance.kuk.edu.ua/..."}.
+    Ключі, що починаються з «_», бот ігнорує (туди можна складати чернетки).
+    Посилання на Moodle з опису події має пріоритет над цим файлом."""
+    try:
+        with open(MOODLE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"WARNING: moodle.json is broken, Moodle links skipped: {e}")
+        return {}
+    return {k: v for k, v in data.items()
+            if isinstance(v, str) and v and not k.startswith("_")}
+
+
+MOODLE_LINKS = load_moodle_links()
 
 
 def normalize_discipline(name: str) -> str:
-    return " ".join((name or "").replace("\u2019", "'").replace("\u02bc", "'").split()).casefold()
+    return " ".join((name or "").replace("’", "'").replace("ʼ", "'").split()).casefold()
 
 
 MOODLE_LINKS_NORM = {
@@ -303,7 +340,7 @@ def detect_type(tail: str) -> Optional[str]:
     return None
 
 
-# Заліки/іспити — виділений блок, лише аудиторія (без Zoom)
+# Заліки/іспити — виділений блок без номера пари
 EXAM_TYPES = {"Залік", "Іспит", "Екзамен"}
 # Усі типи, що показуються виділеним блоком з рамкою
 HIGHLIGHT_TYPES = EXAM_TYPES | {RKR_TYPE}
@@ -321,7 +358,7 @@ def split_summary(summary: str) -> Tuple[str, Optional[str]]:
         etype = detect_type(right)
         if etype:
             return left.strip(), etype
-    # «Маркетинг-Лекція» без пробілів
+    # «Маркетинг-Лекція» без пробілів (як у старому форматі)
     if "-" in s:
         left, right = s.rsplit("-", 1)
         etype = detect_type(right)
@@ -341,15 +378,6 @@ def split_summary(summary: str) -> Tuple[str, Optional[str]]:
 
 MEETING_KINDS = ("zoom", "meet", "teams")
 MEETING_NAMES = {"zoom": "Zoom", "meet": "Google Meet", "teams": "Teams"}
-LINK_LABELS = {
-    "zoom": "🔗 <a href=\"{u}\">Відкрити Zoom</a>",
-    "meet": "🔗 <a href=\"{u}\">Відкрити Google Meet</a>",
-    "teams": "🔗 <a href=\"{u}\">Відкрити Teams</a>",
-    "moodle": "📘 <a href=\"{u}\">Відкрити Moodle</a>",
-    "other": "🔗 <a href=\"{u}\">Посилання</a>",
-}
-
-
 def _unwrap_google_redirect(url: str) -> str:
     """Google Calendar іноді обгортає посилання в google.com/url?q=..."""
     try:
@@ -483,65 +511,108 @@ def classify_place(location: str, description: str,
     return "📍 (місце не вказано)"
 
 
+MORNING_HOUR = 8  # о котрій студенти виходять з дому — під цю годину і температура
+
+
 def get_weather_dnipro(day: dt.date) -> Optional[Dict]:
     lat, lon = 48.45, 34.98
     url = (
         "https://api.open-meteo.com/v1/forecast"
         f"?latitude={lat}&longitude={lon}"
-        "&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+        "&daily=weathercode,temperature_2m_max,temperature_2m_min,"
+        "precipitation_probability_max,wind_speed_10m_max"
+        "&hourly=temperature_2m"
+        "&wind_speed_unit=ms"
         "&timezone=Europe%2FKyiv"
     )
     try:
         r = requests.get(url, timeout=20)
         r.raise_for_status()
         data = r.json()
-        dates = data.get("daily", {}).get("time", [])
-        if not dates:
-            return None
+        daily = data.get("daily", {})
+        dates = daily.get("time", [])
         if day.isoformat() not in dates:
             return None
         idx = dates.index(day.isoformat())
-        wcode = data["daily"]["weathercode"][idx]
-        tmax = data["daily"]["temperature_2m_max"][idx]
-        tmin = data["daily"]["temperature_2m_min"][idx]
-        p = data["daily"]["precipitation_probability_max"][idx]
+
+        # Температура зранку (о MORNING_HOUR), якщо немає — нічний мінімум
+        tmorning = daily["temperature_2m_min"][idx]
+        hourly = data.get("hourly", {})
+        key = f"{day.isoformat()}T{MORNING_HOUR:02d}:00"
+        if key in hourly.get("time", []):
+            v = hourly["temperature_2m"][hourly["time"].index(key)]
+            if v is not None:
+                tmorning = v
+
+        p = daily.get("precipitation_probability_max", [None] * (idx + 1))[idx]
+        wind = daily.get("wind_speed_10m_max", [None] * (idx + 1))[idx]
         return {
-            "desc": weathercode_ua(wcode),
-            "tmin": int(round(tmin)),
-            "tmax": int(round(tmax)),
+            "code": daily["weathercode"][idx],
+            "tmorning": int(round(tmorning)),
+            "tmax": int(round(daily["temperature_2m_max"][idx])),
             "p": int(p) if p is not None else None,
+            "wind": float(wind) if wind is not None else None,
         }
     except Exception:
         return None
 
 
-def weathercode_ua(code: int) -> str:
+def weathercode_ua(code: int) -> Tuple[str, str]:
+    """(іконка, опис) за кодом WMO."""
     mapping = {
-        0: "ясно", 1: "переважно ясно", 2: "мінлива хмарність", 3: "хмарно",
-        45: "туман", 48: "паморозь / туман",
-        51: "мряка", 53: "мряка", 55: "мряка",
-        61: "дощ", 63: "дощ", 65: "сильний дощ",
-        66: "крижаний дощ", 67: "крижаний дощ",
-        71: "сніг", 73: "сніг", 75: "сильний сніг", 77: "снігова крупа",
-        80: "зливи", 81: "зливи", 82: "сильні зливи",
-        85: "снігопад", 86: "сильний снігопад",
-        95: "гроза", 96: "гроза з градом", 99: "гроза з градом",
+        0: ("☀️", "ясно"), 1: ("🌤️", "переважно ясно"), 2: ("⛅", "мінлива хмарність"),
+        3: ("☁️", "хмарно"),
+        45: ("🌫️", "туман"), 48: ("🌫️", "туман з памороззю"),
+        51: ("🌦️", "мряка"), 53: ("🌦️", "мряка"), 55: ("🌦️", "мряка"),
+        56: ("🌧️", "крижана мряка"), 57: ("🌧️", "крижана мряка"),
+        61: ("🌧️", "дощ"), 63: ("🌧️", "дощ"), 65: ("🌧️", "сильний дощ"),
+        66: ("🌧️", "крижаний дощ"), 67: ("🌧️", "крижаний дощ"),
+        71: ("🌨️", "сніг"), 73: ("🌨️", "сніг"), 75: ("❄️", "сильний сніг"),
+        77: ("🌨️", "снігова крупа"),
+        80: ("🌦️", "зливи"), 81: ("🌧️", "зливи"), 82: ("⛈️", "сильні зливи"),
+        85: ("🌨️", "снігопад"), 86: ("❄️", "сильний снігопад"),
+        95: ("⛈️", "гроза"), 96: ("⛈️", "гроза з градом"), 99: ("⛈️", "гроза з градом"),
     }
-    return mapping.get(code, f"погода (код: {code})")
+    return mapping.get(code, ("🌡️", "погода"))
 
 
-def format_weather_block(day: dt.date, label: str) -> str:
-    w = get_weather_dnipro(day)
+SNOW_CODES = {71, 73, 75, 77, 85, 86}
+ICE_CODES = {56, 57, 66, 67}
+
+
+def weather_hints(w: Dict) -> List[str]:
+    """Підказки — тільки коли вони справді потрібні (не більше двох)."""
+    hints = []
+    code = w["code"]
+    if code in ICE_CODES:
+        hints.append("🧊 Ожеледиця — обережно на дорогах")
+    elif code in SNOW_CODES:
+        hints.append("❄️ Сніг — обирай взуття, що не ковзає")
+    elif w.get("p") is not None and w["p"] >= 40:
+        hints.append(f"☔ Візьми парасольку — опади до {w['p']}%")
+    if w["tmorning"] <= 0:
+        hints.append("🧣 Зранку мороз — одягнися тепліше")
+    if w.get("wind") is not None and w["wind"] >= 10:
+        hints.append(f"💨 Сильний вітер — до {int(round(w['wind']))} м/с")
+    return hints[:2]
+
+
+def fmt_temp(t: int) -> str:
+    return f"+{t}°C" if t > 0 else f"{t}°C"
+
+
+def format_weather_block(day: dt.date, label: str, w: Optional[Dict] = None) -> str:
+    if w is None:
+        w = get_weather_dnipro(day)
     if not w:
         return ""
+    icon, desc = weathercode_ua(w["code"])
     lines = [
-        f"⛅ Погода в Дніпрі на {label}:",
-        f"• {w['desc']}",
-        f"• 🌡️ Мін/Макс: {w['tmin']}°C / {w['tmax']}°C",
-    ]
-    if w.get("p") is not None:
-        lines.append(f"• ☔ Ймовірність опадів: {w['p']}%")
-    return "\n".join(lines) + "\n\n"
+        f"{icon} <b>{label.capitalize()} в Дніпрі</b> — {desc}",
+        f"🌅 Зранку <b>{fmt_temp(w['tmorning'])}</b> · вдень до <b>{fmt_temp(w['tmax'])}</b>",
+    ] + weather_hints(w)
+    # Цитата — кольорова смужка й підсвічений фон, погода відділяється від розкладу
+    return "<blockquote>" + "\n".join(lines) + "</blockquote>\n\n"
 
 
 def hhmm(t: dt.datetime) -> str:
@@ -569,113 +640,214 @@ def escape_html_attr(s: str) -> str:
     return escape_html(s).replace('"', "&quot;")
 
 
-def link_line(kind: str, url: str) -> str:
-    return LINK_LABELS[kind].format(u=escape_html_attr(url))
+# Іконки типів занять
+TYPE_ICONS = {
+    "Лекція": "📖",
+    "Гостьова Лекція": "🎤",
+    "Практичне": "✍️",
+    "Лабораторна": "🧪",
+    "Семінар": "🗣️",
+    "Консультація": "💬",
+}
+
+# Короткі підписи посилань для рядка «📘 Moodle · 🔗 Zoom»
+LINK_SHORT = {"zoom": "▶️", "meet": "▶️", "teams": "▶️", "moodle": "📘", "other": "🔗"}
+LINK_TEXT = {
+    "zoom": "Підключитися до Zoom",
+    "meet": "Підключитися до Meet",
+    "teams": "Підключитися до Teams",
+    "moodle": "Відкрити курс у Moodle",
+    "other": "Відкрити посилання",
+}
+
+NO_PLACE = "📍 (місце не вказано)"
 
 
-def format_day(events: List[Event], day: dt.date) -> str:
-    lines = []
-    lines.append(day_header(day))
-    lines.append("")
+def link_html(kind: str, url: str) -> str:
+    # Іконка теж усередині посилання, а текст довгий — більша зона натискання
+    return f'<a href="{escape_html_attr(url)}"><b>{LINK_SHORT[kind]} {LINK_TEXT[kind]} ›</b></a>'
 
-    if not events:
-        lines.append("— (пар немає)")
-        return "\n".join(lines)
 
-    # Заліки/іспити — першими; РКР лишається на своєму місці за часом (у рамці)
+def short_place(location: str, description: str, meeting_kind: Optional[str]) -> str:
+    """Місце для компактного блоку. Якщо є посилання на зустріч, назву сервісу
+    не дублюємо (вона й так на посиланні): просто «🌐 Online»."""
+    place = classify_place(location, description, meeting_kind)
+    if meeting_kind:
+        place = re.sub(r"^🌐 Online \([^)]*\)", "🌐 Online", place)
+    return place
+
+
+def nb(html_text: str) -> str:
+    """Пробіли поза HTML-тегами → нерозривні: пункт переноситься цілим."""
+    return re.sub(r"(<[^>]*>)|( )", lambda m: m.group(1) or " ", html_text)
+
+
+def event_links(ev: Event):
+    """(зустріч, moodle, інші) для події — спільне для тексту й кнопок."""
+    discipline, _ = split_summary(ev.summary)
+    links = extract_links(ev.description + "\n" + ev.location)
+    meeting = next(((k, u) for k, u in links if k in MEETING_KINDS), None)
+    moodle_url = (next((u for k, u in links if k == "moodle"), None)
+                  or MOODLE_LINKS_NORM.get(normalize_discipline(discipline)))
+    other_links = [u for k, u in links if k == "other"][:2]
+    return meeting, moodle_url, other_links
+
+
+def format_event(ev: Event, with_links: bool = True) -> List[str]:
+    """Компактний блок однієї пари (4 рядки)."""
+    discipline, etype = split_summary(ev.summary)
+    text_blob = ev.description + "\n" + ev.location
+    teacher = extract_teacher(ev.description)
+    passcode = extract_passcode(text_blob + "\n" + ev.summary)
+    meeting, moodle_url, other_links = event_links(ev)
+
+    is_exam = etype in EXAM_TYPES
+    is_rkr = etype == RKR_TYPE
+    highlighted = is_exam or is_rkr
+
+    lines: List[str] = []
+    pno = pair_no(ev.start)
+    time_txt = f"{hhmm(ev.start)}–{hhmm(ev.end)}"
+
+    # 1) Час
+    if highlighted:
+        lines.append(separator())
+        lines.append(f"{'🛑' if is_rkr else '📝'} <b>{etype.upper()}!</b>")
+    if pno and not is_exam:
+        lines.append(nb(f"🕒 <b>{pno} пара · {time_txt}</b>"))
+    else:
+        lines.append(nb(f"🕒 <b>{time_txt}</b>"))
+
+    # 2) Дисципліна, під нею — її курс у Moodle (подалі від Zoom)
+    lines.append(f"📚 <b>{escape_html(discipline)}</b>")
+    if with_links and moodle_url:
+        lines.append(nb(link_html("moodle", moodle_url)))
+
+    # 3) Тип · місце
+    place = short_place(ev.location, ev.description, meeting[0] if meeting else None)
+    kind_where = []
+    if etype and not highlighted:
+        kind_where.append(nb(f"{TYPE_ICONS.get(etype, '🎓')} {etype}"))
+    if not (place == NO_PLACE and (moodle_url or meeting)):
+        kind_where.extend(nb(escape_html(p.strip())) for p in place.split("•"))
+    if kind_where:
+        joined = " · ".join(kind_where)
+        # На телефоні в рядок влазить ~26 символів. Якщо тип + місце довші —
+        # місце окремим рядком, щоб «·» не повисала в кінці рядка.
+        if len(kind_where) > 1 and tg_visible_len(joined) > 26 and etype and not highlighted:
+            lines.append(kind_where[0])
+            lines.append(" · ".join(kind_where[1:]))
+        else:
+            lines.append(joined)
+
+    # 4) Викладач
+    if teacher:
+        lines.append(nb(f"👩‍🏫 {escape_html(teacher)}"))
+
+    # 5) Zoom/Meet і інші посилання — внизу, над кодом
+    tools = []
+    if not with_links:
+        moodle_url_txt, meeting_txt, other_txt = None, None, []
+    else:
+        moodle_url_txt, meeting_txt, other_txt = moodle_url, meeting, other_links
+    if meeting_txt:
+        tools.append(nb(link_html(meeting_txt[0], meeting_txt[1])))
+    for u in other_txt:
+        tools.append(nb(link_html("other", u)))
+    # кожне посилання окремим рядком — щоб на телефоні не влучити не туди
+    lines.extend(tools)
+
+    # 6) Код — одразу під своїм Zoom, з підписом
+    if passcode:
+        lines.append(f"🔑 Код: <code>{escape_html(passcode)}</code>")
+
+    if highlighted:
+        lines.append(separator())
+    return lines
+
+
+def sort_events(events: List[Event]) -> List[Event]:
+    """Заліки/іспити — першими; решта (і РКР) — за часом."""
     top = [ev for ev in events if split_summary(ev.summary)[1] in EXAM_TYPES]
     rest = [ev for ev in events if split_summary(ev.summary)[1] not in EXAM_TYPES]
-    sorted_events = top + rest
-
-    for ev in sorted_events:
-        discipline, etype = split_summary(ev.summary)
-        text_blob = ev.description + "\n" + ev.location
-        teacher = extract_teacher(ev.description)
-        passcode = extract_passcode(text_blob + "\n" + ev.summary)
-        links = extract_links(text_blob)
-
-        meeting = next(((k, u) for k, u in links if k in MEETING_KINDS), None)
-        moodle_url = (next((u for k, u in links if k == "moodle"), None)
-                      or MOODLE_LINKS_NORM.get(normalize_discipline(discipline)))
-        other_links = [u for k, u in links if k == "other"][:2]
-
-        is_exam = etype in EXAM_TYPES
-        is_rkr = etype == RKR_TYPE
-        highlighted = is_exam or is_rkr
-
-        if highlighted:
-            lines.append(separator())
-            icon = "🛑" if is_rkr else "📝"
-            lines.append(f"{icon} <b>{etype.upper()}!</b>")
-            if is_rkr:
-                pno = pair_no(ev.start)
-                pfx = f"{pno} пара " if pno else ""
-                lines.append(f"🕒 <b>{pfx}{hhmm(ev.start)}–{hhmm(ev.end)}</b>")
-            else:
-                lines.append(f"🕒 <b>{hhmm(ev.start)}–{hhmm(ev.end)}</b>")
-        else:
-            pno = pair_no(ev.start)
-            pfx = f"{pno} пара " if pno else ""
-            lines.append(f"🕒 <b>{pfx}{hhmm(ev.start)}–{hhmm(ev.end)}</b>")
-
-        lines.append(f"📚 <b>{escape_html(discipline)}</b>")
-
-        if moodle_url:
-            lines.append(link_line("moodle", moodle_url))
-
-        if etype and not highlighted:
-            lines.append(f"🎓 {etype}")
-
-        if teacher:
-            lines.append(f"👩\u200d🏫 {escape_html(teacher)}")
-
-        if is_exam:
-            # Для заліків/іспитів — тільки аудиторія, без Zoom
-            aud = AUD_RE.search(f"{ev.location}\n{ev.description}".lower())
-            if aud:
-                lines.append(f"🏫 {fmt_aud(aud)}")
-        else:
-            place = classify_place(ev.location, ev.description,
-                                   meeting[0] if meeting else None)
-            # Якщо є лише Moodle і більше нічого — «місце не вказано» не пишемо
-            if not (moodle_url and place == "📍 (місце не вказано)"):
-                lines.append(escape_html(place))
-            if meeting:
-                lines.append(link_line(meeting[0], meeting[1]))
-            for u in other_links:
-                lines.append(link_line("other", u))
-            if passcode:
-                lines.append("🔑 Код доступу:")
-                lines.append(f"📎 <code>{escape_html(passcode)}</code>")
-
-        if highlighted:
-            lines.append(separator())
-
-        lines.append("")
-
-    while lines and lines[-1] == "":
-        lines.pop()
-
-    return "\n".join(lines)
+    return top + rest
 
 
-def format_week_message(events: List[Event], start_day: dt.date, end_day: dt.date) -> str:
-    header = (
-        f"🗓️ <b>Розклад на тиждень</b>\n"
-        f"<b>{fmt_date_short(start_day)} – {fmt_date_short(end_day)}</b>\n\n"
-    )
+def format_events(events: List[Event], with_links: bool = True) -> str:
+    return "\n\n".join("\n".join(format_event(ev, with_links)) for ev in sort_events(events))
+
+
+def format_day(events: List[Event], day: dt.date, with_links: bool = True) -> str:
+    """День для ранкового/вечірнього посту — повністю розгорнутий."""
+    out = day_header(day) + "\n\n"
+    if not events:
+        return out + "— (пар немає)"
+    return out + format_events(events, with_links)
+
+
+def plural_pairs(n: int) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return f"{n} пара"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return f"{n} пари"
+    return f"{n} пар"
+
+
+def day_summary(events: List[Event]) -> str:
+    """«3 пари · 09:00–13:50 · 🛑 РКР» — підсумок дня в тижневому пості."""
+    if not events:
+        return "вільний день 🎉"
+    evs = sorted(events, key=lambda e: e.start)
+    parts = [plural_pairs(len(evs)), f"{hhmm(evs[0].start)}–{hhmm(max(e.end for e in evs))}"]
+    types = {split_summary(e.summary)[1] for e in evs}
+    if RKR_TYPE in types:
+        parts.append("🛑 РКР")
+    for t in ("Залік", "Іспит", "Екзамен"):
+        if t in types:
+            parts.append(f"📝 {t.lower()}")
+    return " · ".join(parts)
+
+
+def format_week_day(events: List[Event], day: dt.date) -> str:
+    """День у тижневому пості: заголовок з підсумком + деталі в розгортній цитаті."""
+    head = f"📅 <b>{UA_DOW[day.weekday()]} · {fmt_date_short(day)}</b> — {day_summary(events)}"
+    if not events:
+        return head
+    # У цитаті менше місця — короткий роздільник, щоб не переносився на телефоні
+    body = format_events(events).replace(separator(), "━" * 12)
+    return f"{head}\n<blockquote expandable>{body}</blockquote>"
+
+
+def format_week_messages(events: List[Event], start_day: dt.date, end_day: dt.date) -> List[str]:
+    """Тижневий розклад як список повідомлень. Кожен день — заголовок з підсумком
+    і розгортна цитата з деталями. Якщо все не влазить у ліміт Telegram (4096),
+    ділимо по днях — день ніколи не розривається посередині."""
+    rng = f"{fmt_date_short(start_day)} – {fmt_date_short(end_day)}"
+    title = f"🗓️ <b>Розклад на тиждень · {rng}</b>\n<i>Торкнись блоку під днем, щоб розгорнути пари 👇</i>\n\n"
+    cont_title = f"🗓️ <b>Розклад на тиждень · {rng}</b> (продовження)\n\n"
+    footer = f"\n\n⏱️ Оновлено: {now_kyiv().strftime('%H:%M')}"
+
     by_day: Dict[dt.date, List[Event]] = {
         start_day + dt.timedelta(days=i): []
         for i in range((end_day - start_day).days + 1)
     }
     for ev in events:
         by_day[ev.start.astimezone(KYIV_TZ).date()].append(ev)
-    blocks = []
-    for d in by_day.keys():
-        blocks.append(separator())
-        blocks.append(format_day(by_day[d], d))
-    blocks.append(separator())
-    return header + "\n".join(blocks) + f"\n\n⏱️ Оновлено: {now_kyiv().strftime('%H:%M')}"
+    day_blocks = [format_week_day(by_day[d], d) for d in by_day]
+
+    messages: List[str] = []
+    cur = title
+    has_day = False
+    for block in day_blocks:
+        candidate = cur + ("\n\n" if has_day else "") + block
+        if has_day and tg_visible_len(candidate + footer) > TG_MAX_LEN:
+            messages.append(cur)
+            cur = cont_title + block
+        else:
+            cur = candidate
+        has_day = True
+    messages.append(cur + footer)
+    return messages
 
 
 def tg_send_message(
@@ -683,16 +855,28 @@ def tg_send_message(
     chat_id: str,
     text: str,
     message_thread_id: Optional[int] = None,
+    reply_markup: Optional[Dict] = None,
+    preview_url: Optional[str] = None,
 ) -> None:
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
         "chat_id": chat_id,
         "text": text,
         "parse_mode": "HTML",
-        "disable_web_page_preview": True,
     }
+    if preview_url:
+        # Велика картинка НАД текстом — у тому ж повідомленні
+        payload["link_preview_options"] = {
+            "url": preview_url,
+            "prefer_large_media": True,
+            "show_above_text": True,
+        }
+    else:
+        payload["link_preview_options"] = {"is_disabled": True}
     if message_thread_id is not None:
         payload["message_thread_id"] = message_thread_id
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
     r = requests.post(url, json=payload, timeout=30)
     r.raise_for_status()
     data = r.json()
@@ -700,94 +884,320 @@ def tg_send_message(
         raise RuntimeError(f"Telegram error: {data}")
 
 
+def tg_send_photo(token: str, chat_id: str, path: str,
+                  message_thread_id: Optional[int] = None) -> None:
+    data = {"chat_id": chat_id}
+    if message_thread_id is not None:
+        data["message_thread_id"] = message_thread_id
+    with open(path, "rb") as f:
+        r = requests.post(f"https://api.telegram.org/bot{token}/sendPhoto",
+                          data=data, files={"photo": f}, timeout=60)
+    r.raise_for_status()
+    if not r.json().get("ok"):
+        raise RuntimeError(f"Telegram error: {r.text}")
+
+
+# ───────────────────────── Картинки-банери ─────────────────────────
+
+CARDS_DIR = "cards"
+CARDS_KEEP_DAYS = 14
+UA_MONTHS_GEN = ["січня", "лютого", "березня", "квітня", "травня", "червня", "липня",
+                 "серпня", "вересня", "жовтня", "листопада", "грудня"]
+UA_DOW_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
+
+
+def plain_place(ev: Event, meeting_kind: Optional[str]) -> str:
+    """Місце без емодзі для картинки: «Online · ауд. 207»."""
+    blob = f"{ev.location}\n{ev.description}".lower()
+    parts = []
+    if meeting_kind or "online" in blob or "онлайн" in blob or "zoom" in blob:
+        parts.append("Online")
+    aud = AUD_RE.search(blob)
+    if aud:
+        parts.append(fmt_aud(aud))
+    if not parts:
+        loc = URL_RE.sub("", ev.location).strip(" ,;\n")
+        if loc:
+            parts.append(loc)
+    return " · ".join(parts)
+
+
+def nearest_pair(t: dt.datetime) -> int:
+    """Номер пари для сітки: точний збіг або найближчий час початку."""
+    no = pair_no(t)
+    if no:
+        return no
+    mins = t.hour * 60 + t.minute
+    def dist(item):
+        h, m = map(int, item[0].split(":"))
+        return abs(h * 60 + m - mins)
+    return min(PAIR_BY_START.items(), key=dist)[1]
+
+
+def card_weather(w: Optional[Dict]) -> Optional[Dict]:
+    if not w:
+        return None
+    _, desc = weathercode_ua(w["code"])
+    sign = lambda t: f"+{t}" if t > 0 else str(t)
+    return {"code": w["code"], "tmorning": sign(w["tmorning"]), "tmax": sign(w["tmax"]), "desc": desc}
+
+
+def make_day_card(events: List[Event], day: dt.date, label: str,
+                  w: Optional[Dict], tag: str) -> Optional[str]:
+    if not events:
+        return None
+    try:
+        import cards
+        pairs = []
+        for ev in sort_events(events):
+            discipline, etype = split_summary(ev.summary)
+            meeting, _, _ = event_links(ev)
+            pairs.append({
+                "no": pair_no(ev.start), "start": hhmm(ev.start), "end": hhmm(ev.end),
+                "name": discipline, "teacher": extract_teacher(ev.description),
+                "type": etype, "place": plain_place(ev, meeting[0] if meeting else None),
+            })
+        os.makedirs(CARDS_DIR, exist_ok=True)
+        path = os.path.join(CARDS_DIR, f"day-{day.isoformat()}-{tag}.png")
+        cards.render_day(path, label, UA_DOW[day.weekday()],
+                         f"{day.day} {UA_MONTHS_GEN[day.month - 1]}", card_weather(w), pairs)
+        return path
+    except Exception as e:
+        print(f"WARNING: day card failed: {e}")
+        return None
+
+
+def make_week_card(events: List[Event], start: dt.date, end: dt.date, tag: str) -> Optional[str]:
+    if not events:
+        return None
+    try:
+        import cards
+        n_days = 5
+        for d in (5, 6):   # субота/неділя — лише якщо в них є пари
+            if any(ev.start.astimezone(KYIV_TZ).date() == start + dt.timedelta(days=d) for ev in events):
+                n_days = d + 1
+        days = [(UA_DOW_SHORT[(start + dt.timedelta(days=i)).weekday()],
+                 fmt_date_short(start + dt.timedelta(days=i)), False) for i in range(n_days)]
+        starts = sorted(PAIR_BY_START.items(), key=lambda x: x[1])
+        times = []
+        for t, no in starts:
+            h, m = map(int, t.split(":"))
+            e = dt.datetime(2000, 1, 1, h, m) + dt.timedelta(minutes=80)
+            times.append((no, t, e.strftime("%H:%M")))
+        grid = {}
+        for ev in sort_events(events):
+            c = (ev.start.astimezone(KYIV_TZ).date() - start).days
+            r = nearest_pair(ev.start) - 1
+            if 0 <= c < n_days and 0 <= r < len(times) and (c, r) not in grid:
+                discipline, etype = split_summary(ev.summary)
+                grid[(c, r)] = (discipline, etype)
+        os.makedirs(CARDS_DIR, exist_ok=True)
+        path = os.path.join(CARDS_DIR, f"week-{start.isoformat()}-{tag}.png")
+        cards.render_week(path, f"{fmt_date_short(start)} – {fmt_date_short(end)}", days, times, grid)
+        return path
+    except Exception as e:
+        print(f"WARNING: week card failed: {e}")
+        return None
+
+
+def _git(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *args], capture_output=True, text=True, timeout=90)
+
+
+def cleanup_old_cards(today: dt.date) -> None:
+    """Видаляємо картинки, старші за CARDS_KEEP_DAYS, щоб репозиторій не ріс."""
+    if not os.path.isdir(CARDS_DIR):
+        return
+    border = today - dt.timedelta(days=CARDS_KEEP_DAYS)
+    for name in os.listdir(CARDS_DIR):
+        m = re.search(r"(\d{4}-\d{2}-\d{2})", name)
+        if m and dt.date.fromisoformat(m.group(1)) < border:
+            os.remove(os.path.join(CARDS_DIR, name))
+
+
+def publish_card(path: str, today: dt.date) -> Optional[str]:
+    """Комітить картинку в репозиторій і повертає її пряме посилання,
+    якщо Telegram зможе її відкрити (публічний репозиторій). Інакше None."""
+    repo = os.getenv("GITHUB_REPOSITORY")
+    if not repo or os.getenv("GITHUB_ACTIONS") != "true":
+        return None
+    try:
+        cleanup_old_cards(today)
+        if not _git("config", "user.email").stdout.strip():
+            _git("config", "user.name", "github-actions")
+            _git("config", "user.email", "github-actions@github.com")
+        _git("add", "-A", CARDS_DIR)
+        _git("commit", "-m", f"Schedule card {os.path.basename(path)}")
+        branch = os.getenv("GITHUB_REF_NAME") or "main"
+        for _ in range(3):
+            _git("pull", "--rebase", "--autostash", "origin", branch)
+            if _git("push", "origin", f"HEAD:{branch}").returncode == 0:
+                break
+        else:
+            print("WARNING: could not push card")
+            return None
+        sha = _git("rev-parse", "HEAD").stdout.strip()
+        url = f"https://raw.githubusercontent.com/{repo}/{sha}/{path.replace(os.sep, '/')}"
+        for _ in range(5):
+            try:
+                if requests.head(url, timeout=10).status_code == 200:
+                    return url
+            except requests.RequestException:
+                pass
+            time.sleep(2)
+        print("INFO: card URL not public — sending the picture as a separate photo")
+        return None
+    except Exception as e:
+        print(f"WARNING: publish card failed: {e}")
+        return None
+
+
+TEST_BANNER = "🧪 <b>ТЕСТ</b> — це бачиш тільки ти, у групу не пішло\n\n"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=["today", "tomorrow", "week"], help="Posting mode")
     parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Надіслати пост в особисті (TEST_CHAT_ID), а не в групу. "
+             "Ігнорує дні тижня, не перевіряє і не змінює state.json."
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
-        help="Force post even if weekday restrictions would normally skip it"
+        help="week: опублікувати розклад ПОТОЧНОГО тижня в будь-який день "
+             "(напр. якщо недільний пост не вийшов)."
     )
     args = parser.parse_args()
+    test = args.test
 
     token = env_required("TG_BOT_TOKEN")
-    chat_id = env_required("TG_CHAT_ID")
     ics_url = env_required("GCAL_ICS_URL")
-    schedule_thread_id = env_optional_int("TG_SCHEDULE_THREAD_ID")
+    if test:
+        chat_id = env_required("TEST_CHAT_ID")
+        schedule_thread_id = None
+        print("TEST MODE: posting to TEST_CHAT_ID, state.json is not touched.")
+    else:
+        chat_id = env_required("TG_CHAT_ID")
+        schedule_thread_id = env_optional_int("TG_SCHEDULE_THREAD_ID")
+
+    def send(text: str, thread: Optional[int] = None,
+             reply_markup: Optional[Dict] = None, banner: bool = True,
+             preview_url: Optional[str] = None) -> None:
+        if test and banner:
+            text = TEST_BANNER + text
+        tg_send_message(token, chat_id, text, message_thread_id=thread,
+                        reply_markup=reply_markup, preview_url=preview_url)
+
+    def send_with_card(text: str, card: Optional[str], thread: Optional[int] = None,
+                       banner: bool = True) -> None:
+        """Картинка над текстом в одному повідомленні; якщо посилання на неї
+        недоступне — окремим фото перед текстом. Збій картинки пост не ламає."""
+        url = publish_card(card, today) if card else None
+        if url:
+            send(text, thread, banner=banner, preview_url=url)
+            return
+        if card:
+            try:
+                tg_send_photo(token, chat_id, card, message_thread_id=thread)
+            except Exception as e:
+                print(f"WARNING: photo failed: {e}")
+        send(text, thread, banner=banner)
+
+    def already_posted(key: str, stamp: str) -> bool:
+        return not test and not should_post(state, key, stamp)
+
+    def remember(key: str, stamp: str) -> None:
+        if not test:
+            mark_posted(state, key, stamp)
+            save_state(state)
 
     state = load_state()
     ics = fetch_ics(ics_url)
     all_events = parse_ics_events(ics)
     today = now_kyiv().date()
+    # унікальна назва картинки: Telegram кешує прев'ю за посиланням
+    card_tag = now_kyiv().strftime("%H%M%S") + ("-test" if test else "")
 
     if args.mode == "today":
-        if is_saturday(today) or is_sunday(today):
+        if not test and (is_saturday(today) or is_sunday(today)):
             print("Skipping 'today': no today-posts on Saturday or Sunday.")
             return
         target = today
         stamp = f"today:{iso_date(target)}"
-        if not should_post(state, "last_today", stamp):
+        if already_posted("last_today", stamp):
             print("Already posted today schedule for this date. Exiting.")
             return
         day_events = events_in_range(all_events, target, target)
-        weather = format_weather_block(target, "сьогодні")
+        w = get_weather_dnipro(target)
+        weather = format_weather_block(target, "сьогодні", w)
         msg = "<b>Доброго ранку шановні студенти!</b> ☀️\n\n" + weather
         msg += f"🗓️ <b>Розклад на сьогодні ({fmt_date_short(target)})</b>\n\n"
         msg += format_day(day_events, target)
         msg += f"\n\n⏱️ Оновлено: {now_kyiv().strftime('%H:%M')}"
-        tg_send_message(token, chat_id, msg, message_thread_id=None)
-        mark_posted(state, "last_today", stamp)
-        save_state(state)
+        card = make_day_card(day_events, target, "Розклад на сьогодні", w, card_tag)
+        send_with_card(msg, card)
+        remember("last_today", stamp)
         print("Posted today schedule.")
 
     elif args.mode == "tomorrow":
-        if is_saturday(today):
+        if not test and is_saturday(today):
             print("Skipping 'tomorrow': no posts on Saturday.")
             return
         target = today + dt.timedelta(days=1)
         stamp = f"tomorrow:{iso_date(target)}"
-        if not should_post(state, "last_tomorrow", stamp):
+        if already_posted("last_tomorrow", stamp):
             print("Already posted tomorrow schedule for this date. Exiting.")
             return
         day_events = events_in_range(all_events, target, target)
-        weather = format_weather_block(target, "завтра")
+        w = get_weather_dnipro(target)
+        weather = format_weather_block(target, "завтра", w)
         msg = "<b>Добрий вечір шановні студенти!</b> 🌙\n\n" + weather
         msg += f"🗓️ <b>Розклад на завтра ({fmt_date_short(target)})</b>\n\n"
         msg += format_day(day_events, target)
         msg += f"\n\n⏱️ Оновлено: {now_kyiv().strftime('%H:%M')}"
-        tg_send_message(token, chat_id, msg, message_thread_id=None)
-        mark_posted(state, "last_tomorrow", stamp)
-        save_state(state)
+        card = make_day_card(day_events, target, "Розклад на завтра", w, card_tag)
+        send_with_card(msg, card)
+        remember("last_tomorrow", stamp)
         print("Posted tomorrow schedule.")
 
     elif args.mode == "week":
-        if not args.force and not is_sunday(today):
+        if not test and not args.force and not is_sunday(today):
             print("Skipping 'week': weekly post should run on Sunday only.")
             return
         this_monday = today - dt.timedelta(days=today.weekday())
-        if args.force:
-            week_start = this_monday
-            week_end = week_start + dt.timedelta(days=6)
-            print("Force mode enabled: posting current week.")
+        # --force у будній день — поточний тиждень; у неділю й за розкладом — наступний
+        if args.force and not is_sunday(today):
+            next_monday = this_monday
         else:
-            week_start = this_monday + dt.timedelta(days=7)
-            week_end = week_start + dt.timedelta(days=6)
-            print("Regular Sunday mode: posting next week.")
-        stamp = f"week:{iso_date(week_start)}:{iso_date(week_end)}"
-        if not should_post(state, "last_week", stamp):
+            next_monday = this_monday + dt.timedelta(days=7)
+        next_sunday = next_monday + dt.timedelta(days=6)
+        stamp = f"week:{iso_date(next_monday)}:{iso_date(next_sunday)}"
+        if already_posted("last_week", stamp):
             print("Already posted weekly schedule for this week-range. Exiting.")
             return
-        week_events = events_in_range(all_events, week_start, week_end)
-        msg = format_week_message(week_events, week_start, week_end)
-        if schedule_thread_id is None:
+        week_events = events_in_range(all_events, next_monday, next_sunday)
+        messages = format_week_messages(week_events, next_monday, next_sunday)
+        if not test and schedule_thread_id is None:
             print("WARNING: TG_SCHEDULE_THREAD_ID not set. Weekly post will go to general chat.")
-        tg_send_message(token, chat_id, msg, message_thread_id=schedule_thread_id)
-        # Банку постимо окремим повідомленням — так вона завжди доходить,
-        # незалежно від того, наскільки довгий вийшов розклад на тиждень.
-        tg_send_message(token, chat_id, DONATE_LINE, message_thread_id=schedule_thread_id)
-        mark_posted(state, "last_week", stamp)
-        save_state(state)
-        print("Posted weekly schedule + donate message.")
+        card = make_week_card(week_events, next_monday, next_sunday, card_tag)
+        for i, msg in enumerate(messages):
+            if i == 0:
+                send_with_card(msg, card, thread=schedule_thread_id)
+            else:
+                send(msg, thread=schedule_thread_id, banner=False)
+        # Тиждень уже відправлено — фіксуємо одразу, щоб при збої банки
+        # наступний запуск не задублював розклад.
+        remember("last_week", stamp)
+        # Банка — окремим повідомленням з кнопкою, тож доходить завжди.
+        try:
+            send(DONATE_LINE, thread=schedule_thread_id,
+                 reply_markup=DONATE_BUTTON, banner=False)
+        except Exception as e:
+            print(f"WARNING: donate message failed: {e}")
+        print(f"Posted weekly schedule (next week) in {len(messages)} message(s) + donate.")
 
 
 if __name__ == "__main__":

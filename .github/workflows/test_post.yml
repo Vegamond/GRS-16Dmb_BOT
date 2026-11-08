@@ -1,0 +1,48 @@
+name: Тестовий пост (в особисті)
+
+# Запуск вручну: Actions → «Тестовий пост (в особисті)» → Run workflow.
+# Пост іде тобі в особисті (секрет TEST_CHAT_ID), а не в групу; state.json не змінюється.
+# Перед першим запуском: напиши боту /start і додай секрет TEST_CHAT_ID (свій chat id).
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Який пост показати"
+        required: true
+        default: tomorrow
+        type: choice
+        options:
+          - today
+          - tomorrow
+          - week
+
+permissions:
+  contents: write   # бот комітить картинку, щоб Telegram міг її показати
+
+concurrency:
+  group: test-post
+  cancel-in-progress: false
+
+jobs:
+  test-post:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Send test post
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          GCAL_ICS_URL: ${{ secrets.GCAL_ICS_URL }}
+          TEST_CHAT_ID: ${{ secrets.TEST_CHAT_ID }}
+        run: python calendar_bot.py ${{ inputs.mode }} --test
