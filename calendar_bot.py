@@ -1090,6 +1090,16 @@ def publish_card(path: str, today: dt.date) -> Optional[str]:
         return None
 
 
+# Запуски за розкладом GitHub часто запізнюються на години. Щоб запізнілий
+# запуск не опублікував недоречне (напр. «розклад на завтра» о 2-й ночі вже
+# на післязавтра), автоматичні запуски працюють лише у своєму вікні (години
+# за Києвом, [від, до)). Ручні запуски й cron-job.org — у будь-який час.
+SCHEDULE_WINDOWS = {
+    "today": (4, 13),
+    "tomorrow": (15, 24),
+    "week": (12, 24),
+}
+
 QUIET_UNTIL = 7   # до цієї години пости йдуть без звуку
 QUIET_FROM = 22   # і з цієї години — теж
 
@@ -1160,6 +1170,14 @@ def main():
         if not test:
             mark_posted(state, key, stamp)
             save_state(state)
+
+    if os.getenv("GITHUB_EVENT_NAME") == "schedule" and not test:
+        lo, hi = SCHEDULE_WINDOWS[args.mode]
+        h = now_kyiv().hour
+        if not lo <= h < hi:
+            print(f"Skipping '{args.mode}': scheduled run arrived at {h:02d}h Kyiv, "
+                  f"outside its {lo:02d}–{hi:02d}h window (GitHub delay).")
+            return
 
     state = load_state()
     ics = fetch_ics(ics_url)
